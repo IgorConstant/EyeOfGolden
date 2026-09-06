@@ -1,5 +1,7 @@
 #include "ge_asset_pack.h"
 #include "ge_port.h"
+#include "ge_original_input.h"
+#include "joy.h"
 
 #include <assert.h>
 #include <math.h>
@@ -312,6 +314,33 @@ int main(int argc, char **argv)
 
     ticks = ge_port_advance(&state, -1.0, &input);
     assert(ticks == 0);
+
+    /* Dual analog presents the original two-controller 2.2 layout: the look
+     * stick and the primary buttons sit on the player's controller, the move
+     * stick on the second one with aim as its Z trigger, and no C-buttons are
+     * synthesized. The role accessors are unchanged. */
+    ge_original_input_set_dual_analog(1);
+    input = (GePortInput){0};
+    input.move_x = 0.5f;
+    input.look_x = 1.0f;
+    input.look_y = -1.0f;
+    input.held = GE_PORT_ACTION_FIRE | GE_PORT_ACTION_AIM | GE_PORT_ACTION_CROUCH;
+    ticks = ge_port_advance(&state, 1.0 / 60.0, &input);
+    assert(ticks == 1);
+    assert(state.original_buttons == Z_TRIG);
+    assert(joyGetButtons(1, ANY_BUTTON) == Z_TRIG);
+    assert(joyGetStickX(0) == 60 && joyGetStickY(0) == -60);
+    assert(joyGetStickX(1) == 30 && joyGetStickY(1) == 0);
+    assert(fabsf(state.original_move_x - 0.5f) < 0.00001f);
+    assert(fabsf(state.original_look_x - 1.0f) < 0.00001f);
+    ge_original_input_set_dual_analog(0);
+    input.look_x = 0.0f;
+    input.look_y = 0.0f;
+    ticks = ge_port_advance(&state, 1.0 / 60.0, &input);
+    assert(ticks == 1);
+    assert(state.original_buttons == (Z_TRIG | L_TRIG | R_TRIG));
+    assert(joyGetButtons(1, ANY_BUTTON) == 0U);
+    assert(joyGetStickX(0) == 30 && joyGetStickX(1) == 0);
 
     /* A target with a fixed per-frame budget delivers the same canonical
      * ticks, but drops an overload backlog instead of replaying it forever. */

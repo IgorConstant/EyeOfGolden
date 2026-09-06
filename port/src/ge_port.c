@@ -15,22 +15,25 @@
 #define GE_PORT_MAX_PITCH 1.45f
 #define GE_PORT_CSTICK_BUTTON_THRESHOLD 0.35f
 
-static uint16_t ge_port_n64_buttons(const GePortInput *input)
+/* Presents the logical port actions as N64 buttons. The single-stick layout
+ * feeds GoldenEye's 1.1 (Honey) body: Z fire, L aim, R crouch, C-buttons for
+ * digital strafe/look quantized from the look stick. The dual-analog layout
+ * feeds the 2.2 (Galore) body: fire is Z on the player's controller and aim
+ * is Z on the second controller; strafe, look, crouch (aim + walk stick down)
+ * and zoom come from the two analog sticks, so no C-buttons are synthesized. */
+static uint16_t ge_port_n64_buttons(const GePortInput *input,
+                                    uint16_t *secondary_buttons)
 {
     uint16_t buttons = 0U;
+    uint16_t secondary = 0U;
     const uint32_t actions = input->held | input->pressed;
+    const int dual_analog = ge_original_input_dual_analog();
 
     if ((actions & GE_PORT_ACTION_FIRE) != 0U) {
         buttons |= Z_TRIG;
     }
     if ((actions & (GE_PORT_ACTION_USE | GE_PORT_ACTION_RELOAD)) != 0U) {
         buttons |= B_BUTTON;
-    }
-    if ((actions & GE_PORT_ACTION_CROUCH) != 0U) {
-        buttons |= R_TRIG;
-    }
-    if ((actions & GE_PORT_ACTION_AIM) != 0U) {
-        buttons |= L_TRIG;
     }
     if ((actions & GE_PORT_ACTION_NEXT_WEAPON) != 0U) {
         buttons |= A_BUTTON;
@@ -41,18 +44,33 @@ static uint16_t ge_port_n64_buttons(const GePortInput *input)
     if ((actions & GE_PORT_ACTION_PAUSE) != 0U) {
         buttons |= START_BUTTON;
     }
-    /* The stock 1.1 control body consumes N64 C-buttons for digital strafe
-     * and vertical look. Quantizing the 3DS C-stick here keeps all resulting
-     * camera/movement behavior inside bondviewProcessInput. */
-    if (input->look_x < -GE_PORT_CSTICK_BUTTON_THRESHOLD) {
-        buttons |= L_CBUTTONS;
-    } else if (input->look_x > GE_PORT_CSTICK_BUTTON_THRESHOLD) {
-        buttons |= R_CBUTTONS;
+    if (dual_analog) {
+        if ((actions & GE_PORT_ACTION_AIM) != 0U) {
+            secondary |= Z_TRIG;
+        }
+    } else {
+        if ((actions & GE_PORT_ACTION_CROUCH) != 0U) {
+            buttons |= R_TRIG;
+        }
+        if ((actions & GE_PORT_ACTION_AIM) != 0U) {
+            buttons |= L_TRIG;
+        }
+        /* The stock 1.1 control body consumes N64 C-buttons for digital
+         * strafe and vertical look. Quantizing the look stick here keeps all
+         * resulting camera/movement behavior inside bondviewProcessInput. */
+        if (input->look_x < -GE_PORT_CSTICK_BUTTON_THRESHOLD) {
+            buttons |= L_CBUTTONS;
+        } else if (input->look_x > GE_PORT_CSTICK_BUTTON_THRESHOLD) {
+            buttons |= R_CBUTTONS;
+        }
+        if (input->look_y < -GE_PORT_CSTICK_BUTTON_THRESHOLD) {
+            buttons |= D_CBUTTONS;
+        } else if (input->look_y > GE_PORT_CSTICK_BUTTON_THRESHOLD) {
+            buttons |= U_CBUTTONS;
+        }
     }
-    if (input->look_y < -GE_PORT_CSTICK_BUTTON_THRESHOLD) {
-        buttons |= D_CBUTTONS;
-    } else if (input->look_y > GE_PORT_CSTICK_BUTTON_THRESHOLD) {
-        buttons |= U_CBUTTONS;
+    if (secondary_buttons != NULL) {
+        *secondary_buttons = secondary;
     }
     return buttons;
 }
@@ -89,7 +107,8 @@ static void ge_port_tick(GePortState *state, unsigned retrace_frames)
     original_input.move_y = state->input.move_y;
     original_input.look_x = state->input.look_x;
     original_input.look_y = state->input.look_y;
-    original_input.buttons = ge_port_n64_buttons(&state->input);
+    original_input.buttons = ge_port_n64_buttons(
+        &state->input, &original_input.buttons_secondary);
     ge_original_input_tick(&original_input);
     state->original_move_x = ge_original_input_move_x();
     state->original_move_y = ge_original_input_move_y();

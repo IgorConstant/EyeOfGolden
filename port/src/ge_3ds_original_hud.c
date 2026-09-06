@@ -872,6 +872,9 @@ static float ge_frontend_y(float original_y)
     return original_y * (240.0f / 330.0f);
 }
 
+/* textMeasure height of one Zurich Bold line in front.c's 440x330 space. */
+#define GE_FRONTEND_ZURICH_LINE_HEIGHT 16.0f
+
 static int ge_emit_frontend_box(
     Ge3dsOriginalHudDrawList *draw_list, size_t *vertex_count,
     float left, float top, float right, float bottom,
@@ -1268,21 +1271,19 @@ int ge_3ds_original_frontend_build_draw_list_exact(
                     zurich, &lines[index], draw_list, &vertex_count)) return 0;
         }
     } else if (page == GE_3DS_ORIGINAL_FRONTEND_PAGE_FILE_SELECT) {
-        static const float action_x[3] = {110.0f, 247.0f, 357.0f};
-        for (index = 0U; index < line_count && index < 3U; ++index) {
+        /* constructor_menu05_fileselect draws no text for the first action
+         * channel: the SELECTFILE sprite centered at x=110 is the whole
+         * label. Copy and Erase are white textRender calls whose left edge
+         * sits at 247 and 357, centered vertically on the icon row (285).
+         * Line zero keeps carrying the selected wallet in its status byte.
+         * During erase confirmation the bridge supplies authored positions
+         * for Erase file?/Cancel/Confirm, which the wallet code places. */
+        static const float action_x[3] = {0.0f, 247.0f, 357.0f};
+        const float text_top = 285.0f - GE_FRONTEND_ZURICH_LINE_HEIGHT * 0.5f;
+        for (index = 1U; index < line_count && index < 3U; ++index) {
             if (lines[index].has_authored_position) continue;
-            const float shade = lines[index].selected
-                ? 1.0f : 235.0f / 255.0f;
-            const float green = lines[index].selected
-                ? 1.0f : 216.0f / 255.0f;
-            const float blue = lines[index].selected
-                ? 1.0f : 121.0f / 255.0f;
-            /* constructor_menu05_fileselect places Select/Copy/Erase on the
-             * same authored baseline.  During erase confirmation the bridge
-             * supplies Erase file?/Cancel/Confirm in these three channels,
-             * so the complete confirmation UI remains visible as well. */
-            if (!ge_emit_frontend_text_centered(zurich, lines[index].text,
-                    action_x[index], 285.0f, shade, green, blue,
+            if (!ge_emit_frontend_text_at(zurich, lines[index].text,
+                    action_x[index], text_top, 440.0f, 1.0f, 1.0f, 1.0f,
                     draw_list, &vertex_count)) return 0;
         }
     } else if (page == GE_3DS_ORIGINAL_FRONTEND_PAGE_MODE_SELECT) {

@@ -407,8 +407,13 @@ int main(void)
             &atlas, GE_3DS_ORIGINAL_FRONTEND_PAGE_FILE_SELECT, file_lines,
             sizeof(file_lines) / sizeof(file_lines[0]), &draw));
         assert(draw.visible && draw.box_vertex_count >= 48U);
-        assert(draw.glyph_count == 16U);
-        assert(draw.glyph_vertex_count == 16U * 6U);
+        /* Only Copy and Erase are text; the Select File label is a sprite
+         * and the channel-zero Confirm string is never rendered. */
+        assert(draw.glyph_count == 9U);
+        assert(draw.glyph_vertex_count == 9U * 6U);
+        /* Copy is left-aligned at authored x=247 -> screen 40+247*320/440. */
+        assert(draw.vertices[draw.box_vertex_count].x
+            >= 40.0f + 247.0f * (320.0f / 440.0f) - 1.0f);
         assert(ge_3ds_original_frontend_build_sprite_list(
             GE_3DS_ORIGINAL_FRONTEND_PAGE_FILE_SELECT, 0U, &sprites));
         assert(sprites.count == 3U);

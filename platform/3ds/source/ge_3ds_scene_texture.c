@@ -424,6 +424,13 @@ GeTextureUvStatus ge_3ds_scene_texture_uv_prepare(
     return GE_TEXTURE_UV_OK;
 }
 
+/* Rare's compressed textures store their rows bottom-up: TMEM row 0, which
+ * the RSP samples at t = 0, is the visual bottom of the image. That is why
+ * the original blits every 2D sprite with display_image_at_position's flipY
+ * and why authored model coordinates have t growing toward the top of a
+ * surface. tex2png restores top-down PNGs before tex3ds, so the PNG's top
+ * row is the atlas top corner. Normalized t therefore interpolates from the
+ * atlas bottom edge (t = 0) toward the top edge (t = height). */
 static void ge_3ds_scene_texture_map_normalized(
     const Ge3dsSceneTextureUvContext *context,
     const GeTextureUv *normalized, GeTextureUv *result)
@@ -432,8 +439,8 @@ static void ge_3ds_scene_texture_map_normalized(
     const float top_v = context->top_left_v + context->top_delta_v * normalized->u;
     const float bottom_u = context->bottom_left_u + context->bottom_delta_u * normalized->u;
     const float bottom_v = context->bottom_left_v + context->bottom_delta_v * normalized->u;
-    result->u = top_u + (bottom_u - top_u) * normalized->v;
-    result->v = top_v + (bottom_v - top_v) * normalized->v;
+    result->u = bottom_u + (top_u - bottom_u) * normalized->v;
+    result->v = bottom_v + (top_v - bottom_v) * normalized->v;
 }
 
 GeTextureUvStatus ge_3ds_scene_texture_map_generated_uv_prepared(
@@ -501,8 +508,9 @@ GeTextureUvStatus ge_3ds_scene_texture_map_uv(
         + (bottom_right_u - bottom_left_u) * normalized.u;
     bottom_v = bottom_left_v
         + (bottom_right_v - bottom_left_v) * normalized.u;
-    result->u = top_u + (bottom_u - top_u) * normalized.v;
-    result->v = top_v + (bottom_v - top_v) * normalized.v;
+    /* Same bottom-up row convention as ge_3ds_scene_texture_map_normalized. */
+    result->u = bottom_u + (top_u - bottom_u) * normalized.v;
+    result->v = bottom_v + (top_v - bottom_v) * normalized.v;
     return GE_TEXTURE_UV_OK;
 }
 

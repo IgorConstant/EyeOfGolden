@@ -37,5 +37,16 @@ int main(void)
     assert(provider->global_timer_delta == 0.0f);
     assert(provider->fov_y == 60.0f);
     assert(provider->speedgraph_frames == 1);
+
+    /* The chosen control style applies at once and survives later resets,
+     * like the original save-file option. */
+    ge_original_bond_input_set_control_style(5);
+    assert(provider->control_type == 5);
+    assert(ge_original_bond_input_control_style() == 5);
+    ge_original_bond_input_provider_reset_normal_dam();
+    assert(provider->control_type == 5);
+    ge_original_bond_input_set_control_style(0);
+    ge_original_bond_input_provider_reset_normal_dam();
+    assert(provider->control_type == 0);
     return 0;
 }

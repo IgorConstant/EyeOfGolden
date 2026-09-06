@@ -3,6 +3,7 @@
 #include <assert.h>
 
 #include <ultra64.h>
+#include "joy.h"
 
 int main(void)
 {
@@ -20,5 +21,23 @@ int main(void)
     assert(frame.stick_y == -60);
     assert(frame.buttons == (A_BUTTON | Z_TRIG));
     assert(frame.oldbuttons == B_BUTTON);
+
+    /* Dual analog: MoveBond's raw stick is the player's own controller, which
+     * the 2.x styles treat as turn/pitch, so it now carries the look sample;
+     * the move sample and secondary buttons land on controller 1. */
+    ge_original_input_set_dual_analog(1);
+    sample.look_x = -0.25f;
+    sample.look_y = 1.0f;
+    sample.buttons_secondary = Z_TRIG;
+    ge_original_input_tick(&sample);
+    ge_original_input_read_bond_frame(0U, &frame);
+    assert(frame.stick_x == -15);
+    assert(frame.stick_y == 60);
+    assert(frame.buttons == (A_BUTTON | Z_TRIG));
+    assert(joyGetStickX(1) == 30 && joyGetStickY(1) == -60);
+    assert(joyGetButtons(1, ANY_BUTTON) == Z_TRIG);
+    assert(ge_original_input_move_x() > 0.49f && ge_original_input_move_x() < 0.51f);
+    assert(ge_original_input_look_y() > 0.99f);
+    ge_original_input_set_dual_analog(0);
     return 0;
 }

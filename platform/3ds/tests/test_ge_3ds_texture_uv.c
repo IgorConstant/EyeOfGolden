@@ -81,6 +81,27 @@ static void test_exact_mapping(void)
     puts("prepared UV: 4194304 byte-exact normal/atlas comparisons, rotated/padded atlases, signed ST, scales/shifts and non-power-of-two dimensions passed");
 }
 
+/* Rare textures are stored bottom-up, so RSP t = 0 must sample the atlas
+ * bottom edge and t = height the top edge; the original blits sprites with
+ * flipY for the same reason. */
+static void test_row_orientation(void)
+{
+    GePicaMaterial material = {.texture_scale_s=UINT16_MAX,.texture_scale_t=UINT16_MAX};
+    Ge3dsSceneTextureSlot slot = {.loaded=1U,.width=32U,.height=16U,
+        .subtexture={0.0f,1.0f,0.25f,0.5f}};
+    Ge3dsSceneTextureUvContext context;
+    GeTextureUv uv;
+    rotated=0;
+    assert(ge_3ds_scene_texture_uv_prepare(&slot,&material,&context)==GE_TEXTURE_UV_OK);
+    assert(ge_3ds_scene_texture_map_uv_prepared(&context,0,0,&uv)==GE_TEXTURE_UV_OK);
+    assert(fabsf(uv.v - 0.5f) < 1e-6f && fabsf(uv.u - 0.0f) < 1e-6f);
+    assert(ge_3ds_scene_texture_map_uv_prepared(&context,0,(int16_t)(16*32),&uv)==GE_TEXTURE_UV_OK);
+    assert(fabsf(uv.v - 1.0f) < 1e-5f);
+    assert(ge_3ds_scene_texture_map_uv_prepared(&context,(int16_t)(32*32),(int16_t)(8*32),&uv)==GE_TEXTURE_UV_OK);
+    assert(fabsf(uv.u - 0.25f) < 1e-5f && fabsf(uv.v - 0.75f) < 1e-5f);
+    puts("texture rows: t=0 samples the atlas bottom, t=height the top");
+}
+
 static void test_snapshot_and_failure(void)
 {
     GePicaMaterial material = {.texture_scale_s=UINT16_MAX,.texture_scale_t=32768U};
@@ -144,7 +165,8 @@ static void benchmark(void)
 #endif
 int main(void)
 {
-    test_exact_mapping(); test_snapshot_and_failure();
+    test_exact_mapping();
+    test_row_orientation(); test_snapshot_and_failure();
 #ifdef GE_TEXTURE_UV_BENCH
     benchmark();
 #endif

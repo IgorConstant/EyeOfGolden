@@ -2645,6 +2645,7 @@ if [[ -f "${repo_dir}/build/3ds-levels/dam/collision/collision.gestan" \
 fi
 "${repo_dir}/scripts/test_effect_buffers.sh"
 "${repo_dir}/scripts/test_original_frontend_visuals.sh"
+"${repo_dir}/scripts/test_3ds_frontend_diagnostics.sh" "${repo_dir}"
 "${repo_dir}/scripts/test_bond_camera_live.sh"
 "${repo_dir}/scripts/test_first_person_pose.sh"
 "${repo_dir}/scripts/test_dam_guard_chr_scheduler.sh"

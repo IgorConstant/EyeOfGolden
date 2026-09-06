@@ -141,31 +141,52 @@ static void ia8_to_ia16(uint8_t *in, png_bytep out, int numpixels)
 }
 
 /**
+ * Fetch one packed four-bit texel. Rows are packed independently, so an
+ * odd-width image carries an unused low nibble at the end of every row
+ * (texChannelsToPixels advances (width + 1) / 2 bytes per row). Reading the
+ * nibbles as one continuous stream would shift each row by one texel and
+ * shear odd-width images such as the 65-wide folder photographs.
+ */
+static uint8_t packed_nibble(uint8_t *in, int width, int x, int y)
+{
+	uint8_t byte = in[y * ((width + 1) / 2) + x / 2];
+
+	return x & 1 ? byte & 0xf : byte >> 4;
+}
+
+/**
  * Convert IA 3/1 to IA 8/8.
  */
-static void ia4_to_ia16(uint8_t *in, png_bytep out, int numpixels)
+static void ia4_to_ia16(uint8_t *in, png_bytep out, int width, int height)
 {
-	int i;
+	int x;
+	int y;
+	int outpos = 0;
 
-	for (i = 0; i < numpixels; i++) {
-		uint8_t value = i & 1 ? in[i / 2] & 0xf : in[i / 2] >> 4;
+	for (y = 0; y < height; y++) {
+		for (x = 0; x < width; x++) {
+			uint8_t value = packed_nibble(in, width, x, y);
 
-		out[i * 2 + 0] = ((value >> 1) & 7) * 32;
-		out[i * 2 + 1] = (value & 1) * 255;
+			out[outpos + 0] = ((value >> 1) & 7) * 32;
+			out[outpos + 1] = (value & 1) * 255;
+			outpos += 2;
+		}
 	}
 }
 
 /**
  * Convert I 4 to I 8.
  */
-static void i4_to_i8(uint8_t *in, png_bytep out, int numpixels)
+static void i4_to_i8(uint8_t *in, png_bytep out, int width, int height)
 {
-	int i;
+	int x;
+	int y;
+	int outpos = 0;
 
-	for (i = 0; i < numpixels; i++) {
-		uint8_t value = i & 1 ? in[i / 2] & 0xf : in[i / 2] >> 4;
-
-		out[i] = value * 17;
+	for (y = 0; y < height; y++) {
+		for (x = 0; x < width; x++) {
+			out[outpos++] = packed_nibble(in, width, x, y) * 17;
+		}
 	}
 }
 
@@ -211,10 +232,10 @@ static bool write_image(struct pd_image *image, struct pd_tex *tex, char *outfil
 		ia8_to_ia16(image->pixels, buffer, image->width * image->height);
 		break;
 	case PDFORMAT_IA4:
-		ia4_to_ia16(image->pixels, buffer, image->width * image->height);
+		ia4_to_ia16(image->pixels, buffer, image->width, image->height);
 		break;
 	case PDFORMAT_I4:
-		i4_to_i8(image->pixels, buffer, image->width * image->height);
+		i4_to_i8(image->pixels, buffer, image->width, image->height);
 		break;
 	case PDFORMAT_RGBA16_CI8:
 		rgba16_to_rgba32(tex->palette, palette, tex->numcolours);

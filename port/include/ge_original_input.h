@@ -11,6 +11,9 @@ typedef struct GeOriginalInputSample {
     float look_x;
     float look_y;
     uint16_t buttons;
+    /* Buttons presented on the second virtual controller. Only the original
+     * two-controller styles (2.1-2.4) read it; Z there is the aim trigger. */
+    uint16_t buttons_secondary;
 } GeOriginalInputSample;
 
 typedef struct GeOriginalBondInputFrame {
@@ -25,6 +28,17 @@ void ge_original_input_init(void);
 
 /* Queues and consumes one sample through joy.c's original 20-entry ring. */
 void ge_original_input_tick(const GeOriginalInputSample *sample);
+
+/* Selects the controller layout presented to the original control bodies.
+ * Single stick (default): controller 0 carries the move stick and every
+ * button, controller 1 carries the look stick, as GoldenEye's 1.x styles
+ * expect. Dual analog: the original two-controller styles (2.1-2.4) read
+ * turn/pitch from controller 0's stick and walk/strafe from controller 1's,
+ * so the look stick is presented on controller 0 and the move stick on
+ * controller 1, with buttons_secondary on controller 1. The move/look
+ * accessors below always report by role, never by controller index. */
+void ge_original_input_set_dual_analog(int enabled);
+int ge_original_input_dual_analog(void);
 
 float ge_original_input_move_x(void);
 float ge_original_input_move_y(void);

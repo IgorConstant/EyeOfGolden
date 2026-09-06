@@ -34,8 +34,15 @@ typedef struct GeOriginalBondInputProvider {
     int32_t speedgraph_frames;
 } GeOriginalBondInputProvider;
 
-/* Selects the original normal 1.1/Honey single-player Dam branches. */
+/* Selects the original normal single-player Dam branches. The control style
+ * is the one last chosen with ge_original_bond_input_set_control_style
+ * (1.1/Honey until changed); like the original save-file option it survives
+ * stage resets. */
 void ge_original_bond_input_provider_reset_normal_dam(void);
+/* CONTROLLER_CONFIG_* value read by the canonical bondviewProcessInput body
+ * for every following reset, applied immediately as well. */
+void ge_original_bond_input_set_control_style(int32_t control_type);
+int32_t ge_original_bond_input_control_style(void);
 GeOriginalBondInputProvider *ge_original_bond_input_provider(void);
 void ge_original_bond_input_bind_player(
     struct player *player, struct player_data *permissions);

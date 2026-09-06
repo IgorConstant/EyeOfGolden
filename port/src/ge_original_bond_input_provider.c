@@ -4,6 +4,7 @@
 #include <string.h>
 
 static GeOriginalBondInputProvider g_provider;
+static int32_t g_control_style; /* CONTROLLER_CONFIG_HONEY (1.1) */
 
 /* Canonical single-player globals used directly by unchanged gameplay and AI
  * bodies.  The camera extraction intentionally owns differently named compact
@@ -37,7 +38,7 @@ void ge_original_bond_input_provider_reset_normal_dam(void)
     g_provider.player_permissions = player_permissions;
     g_provider.player_count = 1;
     g_provider.player_actions_enabled = 1;
-    g_provider.control_type = 0; /* CONTROLLER_CONFIG_HONEY (1.1) */
+    g_provider.control_type = g_control_style;
     g_provider.fov_y = 60.0f;
     g_provider.speedgraph_frames = 1;
     ge_original_bond_input_publish_canonical_player(current_player);
@@ -46,6 +47,17 @@ void ge_original_bond_input_provider_reset_normal_dam(void)
 GeOriginalBondInputProvider *ge_original_bond_input_provider(void)
 {
     return &g_provider;
+}
+
+void ge_original_bond_input_set_control_style(int32_t control_type)
+{
+    g_control_style = control_type;
+    g_provider.control_type = control_type;
+}
+
+int32_t ge_original_bond_input_control_style(void)
+{
+    return g_control_style;
 }
 
 void ge_original_bond_input_bind_player(

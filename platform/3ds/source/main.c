@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "ge_asset_pack.h"
 #include "ge_blotter_model.h"
@@ -30,6 +31,8 @@
 #include "ge_3ds_alloc_profile.h"
 #include "ge_3ds_original_autogun_beam.h"
 #include "ge_3ds_fade_overlay.h"
+#include "ge_3ds_frontend_probe.h"
+#include "ge_3ds_stereo.h"
 #include "ge_3ds_original_frontend_cast.h"
 #include "ge_3ds_original_hud.h"
 #include "ge_3ds_save_provider.h"
@@ -315,6 +318,26 @@ _Static_assert(FIRST_PERSON_SOURCE_VERTEX_CAPACITY
     "sdmc:/3ds/goldeneye-3ds/frontend-visual-probe.cfg"
 #define SAVE_SLOT_PATH \
     "sdmc:/3ds/goldeneye-3ds/goldeneye.sav"
+#define FRONTEND_PROBE_PATH "sdmc:/3ds/goldeneye-3ds/frontend-probe.cfg"
+#define FRONTEND_PROBE_RESULT_PATH \
+    "sdmc:/3ds/goldeneye-3ds/frontend-probe.result"
+#define FRONTEND_PROBE_CAPTURE_DIR "sdmc:/3ds/goldeneye-3ds/captures"
+
+/* Diagnostic-only scripted menu traversal; inactive without its config. */
+static Ge3dsFrontendProbe frontend_probe;
+static bool frontend_probe_loaded;
+static uint64_t frontend_frame_begin_wait_ticks;
+
+#define STEREO_CONFIG_PATH "sdmc:/3ds/goldeneye-3ds/stereo.cfg"
+#define CONTROLS_CONFIG_PATH "sdmc:/3ds/goldeneye-3ds/controls.cfg"
+/* Stereoscopic state. The right-eye target is created at startup; each
+ * gameplay frame decides from the 3D slider whether to submit it. */
+static int stereo_uniform = -1;
+static Ge3dsStereoConfig stereo_config;
+static float stereo_slider;
+static int stereo_current_eye;          /* -1 left, +1 right, 0 mono */
+static float stereo_screen_x_column[2]; /* tilted ortho screen-x column */
+static C3D_RenderTarget *right_target;
 
 _Static_assert(CROSSHAIR_VERTEX_COUNT == 6U,
                "the canonical sight rectangle publishes six vertices");
@@ -11641,6 +11664,48 @@ static bool dam_visibility_contains_room(const RuntimeDamPreview *preview,
     return false;
 }
 
+/* Uploads the per-eye clip shift for the layer about to be drawn. Mono
+ * rendering (eye 0) and a zero slider upload zeros, so every existing draw
+ * keeps its exact mono position. */
+static void renderer_set_stereo_layer(Ge3dsStereoLayer layer)
+{
+    Ge3dsStereoUniforms uniforms;
+    if (stereo_uniform < 0) return;
+    ge_3ds_stereo_uniforms(&stereo_config, stereo_slider, stereo_current_eye,
+                           layer, stereo_screen_x_column, &uniforms);
+    C3D_FVUnifSet(GPU_VERTEX_SHADER, stereo_uniform,
+                  uniforms.coefficient[0], uniforms.coefficient[1], 0.0f, 0.0f);
+    C3D_FVUnifSet(GPU_VERTEX_SHADER, stereo_uniform + 1,
+                  uniforms.constant[0], uniforms.constant[1], 0.0f, 0.0f);
+}
+
+/* CPU frustum culling must not reject geometry that the eye offset moves
+ * into view. Scaling the clip-x column relaxes |x| <= w to
+ * |x| <= (1 + margin) * w for the culling copy only; GPU matrices are
+ * untouched. */
+static void renderer_stereo_widen_clip(const float source[4][4],
+                                       float widened[4][4], float margin)
+{
+    size_t row;
+    memcpy(widened, source, sizeof(float) * 16U);
+    if (!(margin > 0.0f)) return;
+    for (row = 0U; row < 4U; ++row)
+        widened[row][0] = source[row][0] / (1.0f + margin);
+}
+
+typedef struct RuntimeWorldRun {
+    uint32_t first_vertex;
+    uint32_t vertex_count;
+    uint16_t batch;
+} RuntimeWorldRun;
+
+#define WORLD_RUN_CACHE_CAPACITY 4096U
+/* Draw runs decided by the left eye's visibility/merge pass. The right eye
+ * replays them with the same materials instead of repeating the culling. */
+static RuntimeWorldRun world_run_cache[WORLD_RUN_CACHE_CAPACITY];
+static size_t world_run_count;
+static bool world_run_cache_valid;
+
 static float c3d_matrix_element(const C3D_Mtx *matrix, size_t row,
                                 size_t column)
 {
@@ -12624,16 +12689,36 @@ static uint32_t map_actions(u32 keys)
 {
     uint32_t actions = 0;
 
-    if ((keys & KEY_R) != 0) actions |= GE_PORT_ACTION_FIRE;
+    /* New 3DS XL: R or ZR fires, L or ZL aims. Crouching is the original
+     * 2.2 gesture (hold aim, Circle Pad down) and zoom is aim + Circle Pad
+     * up/down, so no separate crouch button is bound. */
+    if ((keys & (KEY_R | KEY_ZR)) != 0) actions |= GE_PORT_ACTION_FIRE;
+    if ((keys & (KEY_L | KEY_ZL)) != 0) actions |= GE_PORT_ACTION_AIM;
     if ((keys & KEY_B) != 0) actions |= GE_PORT_ACTION_USE;
     if ((keys & KEY_Y) != 0) actions |= GE_PORT_ACTION_RELOAD;
-    if ((keys & KEY_ZR) != 0) actions |= GE_PORT_ACTION_CROUCH;
-    if ((keys & KEY_L) != 0) actions |= GE_PORT_ACTION_AIM;
     if ((keys & KEY_A) != 0) actions |= GE_PORT_ACTION_NEXT_WEAPON;
     if ((keys & KEY_X) != 0) actions |= GE_PORT_ACTION_PREV_WEAPON;
     if ((keys & KEY_START) != 0) actions |= GE_PORT_ACTION_PAUSE;
 
     return actions;
+}
+
+/* controls.cfg: "dual_analog 0" restores the single-stick 1.1 layout
+ * (Circle Pad moves and turns, C-Stick quantized to C-buttons). The default
+ * plays GoldenEye's 2.2 Galore style on the two analog sticks. */
+static bool load_controls_dual_analog(void)
+{
+    bool dual_analog = true;
+    char line[64];
+    FILE *stream = fopen(CONTROLS_CONFIG_PATH, "rb");
+    if (stream == NULL) return dual_analog;
+    while (fgets(line, sizeof(line), stream) != NULL) {
+        int value;
+        if (sscanf(line, " dual_analog %d", &value) == 1)
+            dual_analog = value != 0;
+    }
+    fclose(stream);
+    return dual_analog;
 }
 
 static GePortInput read_input(bool cstick_available)
@@ -13496,6 +13581,16 @@ static bool prepare_original_frontend_pitem_scene(
             runtime->logo_batch_count = batch_count;
             runtime->logo_scene_prop = prop;
             runtime->logo_ready = vertex_count != 0U && batch_count != 0U;
+            ge_3ds_frontend_probe_note(&frontend_probe,
+                prop == PROP_NINTENDOLOGO ? "nintendo_logo_vertices"
+                : prop == PROP_GOLDENEYELOGO ? "goldeneye_logo_vertices"
+                : prop == PROP_LEGALPAGE ? "legal_page_vertices"
+                : "pitem_vertices", vertex_count);
+            ge_3ds_frontend_probe_note(&frontend_probe,
+                prop == PROP_NINTENDOLOGO ? "nintendo_logo_batches"
+                : prop == PROP_GOLDENEYELOGO ? "goldeneye_logo_batches"
+                : prop == PROP_LEGALPAGE ? "legal_page_batches"
+                : "pitem_batches", batch_count);
             for (part_index = 0U; part_index < batch_count; ++part_index) {
                 const GeDamRoomDrawBatch *batch = &batches[part_index];
                 const uint16_t image_id = batch->texture.texture_id;
@@ -13562,9 +13657,13 @@ static bool prepare_original_frontend_pitem_scene(
                 scale = 207.8460969f * 1.2f
                     / fmaxf(1.0f, 3000.0f - z * 1.2f);
             }
+            /* front.c's lookat placement and the standard viewport keep
+             * authored +Y pointing up the screen (folder row +800 is the top
+             * row). The frontend draw list uses the bottom-up Mtx_OrthoTilt
+             * space, so +Y maps to a larger GPU y, like the HUD converter. */
             destination[part_index] = (Vertex){
                 200.0f + x * scale,
-                120.0f - y * scale,
+                120.0f + y * scale,
                 0.5f + z * 0.0f, 0.0f, 0.0f,
                 red, green, blue,
                 (float)source->source.alpha / 255.0f,
@@ -13576,25 +13675,34 @@ static bool prepare_original_frontend_pitem_scene(
                 &runtime->logo_batches[part_index];
             const Ge3dsSceneTextureSlot *slot =
                 original_frontend_batch_texture(runtime, prop, batch);
+            const bool lit_reflection = (prop == PROP_GOLDENEYELOGO
+                    || prop == PROP_NINTENDOLOGO)
+                && batch->material.lighting_enabled != 0U;
+            float tl_u = 0.0f, tl_v = 0.0f, tr_u = 0.0f, tr_v = 0.0f;
+            float bl_u = 0.0f, bl_v = 0.0f, br_u = 0.0f, br_v = 0.0f;
             size_t vertex;
             if (slot == NULL) continue;
+            if (lit_reflection) {
+                /* The subtexture corners are per batch; the per-vertex work
+                 * below only interpolates them. */
+                Tex3DS_SubTextureTopLeft(&slot->subtexture, &tl_u, &tl_v);
+                Tex3DS_SubTextureTopRight(&slot->subtexture, &tr_u, &tr_v);
+                Tex3DS_SubTextureBottomLeft(&slot->subtexture, &bl_u, &bl_v);
+                Tex3DS_SubTextureBottomRight(&slot->subtexture, &br_u, &br_v);
+            }
             for (vertex = batch->first_vertex;
                     vertex < batch->first_vertex + batch->vertex_count;
                     ++vertex) {
                 GeTextureUv uv;
                 const GeDamRoomWorldVertex *source =
                     &runtime->logo_source_vertices[vertex];
-                if ((prop == PROP_GOLDENEYELOGO
-                            || prop == PROP_NINTENDOLOGO)
-                        && batch->material.lighting_enabled != 0U) {
+                if (lit_reflection) {
                     const uint8_t packed_normal[3] = {
                         source->source.red,
                         source->source.green,
                         source->source.blue,
                     };
                     GeOriginalFrontendGeneratedVertex generated;
-                    float tl_u, tl_v, tr_u, tr_v;
-                    float bl_u, bl_v, br_u, br_v;
                     float u;
                     float v;
                     float top_u, top_v, bottom_u, bottom_v;
@@ -13611,14 +13719,6 @@ static bool prepare_original_frontend_pitem_scene(
                         (float)generated.lit_rgba[2] / 255.0f;
                     u = generated.generated_uv[0];
                     v = generated.generated_uv[1];
-                    Tex3DS_SubTextureTopLeft(
-                        &slot->subtexture, &tl_u, &tl_v);
-                    Tex3DS_SubTextureTopRight(
-                        &slot->subtexture, &tr_u, &tr_v);
-                    Tex3DS_SubTextureBottomLeft(
-                        &slot->subtexture, &bl_u, &bl_v);
-                    Tex3DS_SubTextureBottomRight(
-                        &slot->subtexture, &br_u, &br_v);
                     top_u = tl_u + (tr_u - tl_u) * u;
                     top_v = tl_v + (tr_v - tl_v) * u;
                     bottom_u = bl_u + (br_u - bl_u) * u;
@@ -14032,7 +14132,8 @@ static bool prepare_original_frontend_wallet(
             if (!(camera_z < -1.0f)) goto done;
             destination[vertex] = (Vertex){
                 200.0f + camera_x * focal / -camera_z,
-                120.0f - camera_y * focal / -camera_z,
+                /* Bottom-up GPU space: camera +Y is screen-up. */
+                120.0f + camera_y * focal / -camera_z,
                 0.5f, 0.0f, 0.0f,
                 (float)source->source.red / 255.0f,
                 (float)source->source.green / 255.0f,
@@ -14057,8 +14158,10 @@ static bool prepare_original_frontend_wallet(
                 if (destination[vertex].y > bottom)
                     bottom = destination[vertex].y;
             }
+            /* The published extents are bottom-up GPU rows; the cursor
+             * bounds expect top-down VI rows. */
             if (!ge_original_frontend_wallet_bounds_from_top_screen(
-                    left, top, right, bottom,
+                    left, 240.0f - bottom, right, 240.0f - top,
                     &runtime->wallet_bounds[instance_index])) goto done;
             runtime->wallet_centers[instance_index][0] =
                 (200.0f + folder_positions[instance_index][0]
@@ -14631,6 +14734,9 @@ static void configure_original_font_texture_environment(C3D_TexEnv *env)
     C3D_TexEnvSrc(env, C3D_Both,
                   GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
     C3D_TexEnvFunc(env, C3D_Both, GPU_MODULATE);
+    /* citro3d uploads a combiner stage only after it is marked dirty; the
+     * pointer obtained once per frame does not track later edits. */
+    C3D_DirtyTexEnv(env);
 }
 
 static bool prepare_original_frontend_rareware(
@@ -15189,10 +15295,15 @@ static void draw_original_frontend_list(
         renderer_vertex_flush_bytes(
             text_vertex_count + sprite_vertex_count,
             ORIGINAL_HUD_VERTEX_CAPACITY));
-    C3D_FrameBegin(0);
+    {
+        const uint64_t begin_start = svcGetSystemTick();
+        C3D_FrameBegin(0);
+        frontend_frame_begin_wait_ticks = svcGetSystemTick() - begin_start;
+    }
     C3D_RenderTargetClear(top_target, C3D_CLEAR_ALL, CLEAR_COLOR, 0);
     C3D_FrameDrawOn(top_target);
     C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, projection_uniform, &projection);
+    renderer_set_stereo_layer(GE_3DS_STEREO_LAYER_FLAT);
     C3D_SetScissor(GPU_SCISSOR_DISABLE, 0U, 0U, 0U, 0U);
     C3D_FogGasMode(GPU_NO_FOG, GPU_PLAIN_DENSITY, false);
     C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
@@ -15204,7 +15315,7 @@ static void draw_original_frontend_list(
     if (page == GE_3DS_ORIGINAL_FRONTEND_PAGE_FILE_SELECT
             && runtime != NULL && runtime->folder_background_ready) {
         C3D_TexBind(0, (C3D_Tex *)&runtime->folder_background_texture);
-        C3D_TexEnvInit(texture_environment);
+        C3D_TexEnvInit(texture_environment = C3D_GetTexEnv(0));
         C3D_TexEnvSrc(texture_environment, C3D_Both,
                       GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
         C3D_TexEnvFunc(texture_environment, C3D_Both, GPU_MODULATE);
@@ -15238,10 +15349,21 @@ static void draw_original_frontend_list(
         RuntimeRendererMaterialCache material_cache = {0};
         RuntimeRendererPreparedMaterialCache prepared_cache = {0};
         size_t batch_index;
-        for (batch_index = 0U; batch_index < runtime->logo_batch_count;
-                ++batch_index) {
+        for (batch_index = 0U; batch_index < runtime->logo_batch_count;) {
             const GeDamRoomDrawBatch *batch =
                 &runtime->logo_batches[batch_index];
+            /* Authored display lists split these models into hundreds of
+             * tiny batches. Contiguous batches with identical material and
+             * texture are one GPU draw; the vertex order is unchanged. */
+            size_t run_end = batch_index + 1U;
+            size_t run_vertex_count = batch->vertex_count;
+            while (run_end < runtime->logo_batch_count
+                    && dam_batches_compatible(
+                        &runtime->logo_batches[run_end - 1U],
+                        &runtime->logo_batches[run_end])) {
+                run_vertex_count += runtime->logo_batches[run_end].vertex_count;
+                ++run_end;
+            }
             const Ge3dsSceneTextureSlot *slot =
                 original_frontend_batch_texture(
                     runtime, runtime->logo_scene_prop, batch);
@@ -15260,22 +15382,14 @@ static void draw_original_frontend_list(
                  * The display list remains authoritative for culling, alpha,
                  * and any explicit render-mode changes.  The translated
                  * material already includes the constructor's inherited
-                 * zbufferenabled=false state.  CPU projection above maps
-                 * authored +Y to screen -Y, reversing triangle winding, so
-                 * invert only the effective display-list cull face at this
-                 * final screen-space boundary. */
-                if (material_result.state.cull
-                        == GE_PICA_APPLY_CULL_FRONT) {
-                    C3D_CullFace(GPU_CULL_BACK_CCW);
-                } else if (material_result.state.cull
-                        == GE_PICA_APPLY_CULL_BACK) {
-                    C3D_CullFace(GPU_CULL_FRONT_CCW);
-                }
+                 * zbufferenabled=false state and its cull face; the CPU
+                 * projection preserves the authored orientation and winding. */
                 C3D_DrawArrays(GPU_TRIANGLES,
                     ORIGINAL_FRONTEND_MODEL_VERTEX_OFFSET
                         + batch->first_vertex,
-                    batch->vertex_count);
+                    run_vertex_count);
             }
+            batch_index = run_end;
         }
     } else if (menu == MENU_RAREWARE_LOGO
             && runtime != NULL && presentation != NULL
@@ -15289,7 +15403,7 @@ static void draw_original_frontend_list(
         /* load_display_rare_logo publishes these passes in this exact order:
          * textured front, four authored letter quads, textured body. */
         C3D_TexBind(0, &rareware_front_texture);
-        C3D_TexEnvInit(texture_environment);
+        C3D_TexEnvInit(texture_environment = C3D_GetTexEnv(0));
         C3D_TexEnvSrc(texture_environment, C3D_RGB,
                       GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
         C3D_TexEnvFunc(texture_environment, C3D_RGB, GPU_MODULATE);
@@ -15303,7 +15417,7 @@ static void draw_original_frontend_list(
                 && runtime->rareware_mesh->textured) {
             for (letter = 0U; letter < 4U; ++letter) {
                 C3D_TexBind(0, &rareware_textures[letter]);
-                C3D_TexEnvInit(texture_environment);
+                C3D_TexEnvInit(texture_environment = C3D_GetTexEnv(0));
                 C3D_TexEnvSrc(texture_environment, C3D_RGB,
                     GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
                 C3D_TexEnvFunc(texture_environment, C3D_RGB, GPU_MODULATE);
@@ -15315,7 +15429,7 @@ static void draw_original_frontend_list(
             }
         }
         C3D_TexBind(0, &rareware_body_texture);
-        C3D_TexEnvInit(texture_environment);
+        C3D_TexEnvInit(texture_environment = C3D_GetTexEnv(0));
         C3D_TexEnvSrc(texture_environment, C3D_RGB,
                       GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
         C3D_TexEnvFunc(texture_environment, C3D_RGB, GPU_MODULATE);
@@ -15368,7 +15482,7 @@ static void draw_original_frontend_list(
         C3D_TexEnvInit(C3D_GetTexEnv(1));
         if (scene->fade < 1.0f) {
             C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
-            C3D_TexEnvInit(texture_environment);
+            C3D_TexEnvInit(texture_environment = C3D_GetTexEnv(0));
             C3D_TexEnvSrc(texture_environment, C3D_Both,
                           GPU_PRIMARY_COLOR, 0, 0);
             C3D_TexEnvFunc(texture_environment, C3D_Both, GPU_REPLACE);
@@ -15388,7 +15502,7 @@ static void draw_original_frontend_list(
             C3D_TexBind(0, runtime->gunbarrel_sight_texture_loaded
                 ? (C3D_Tex *)&runtime->gunbarrel_sight_texture
                 : (C3D_Tex *)&runtime->folder_background_texture);
-            C3D_TexEnvInit(texture_environment);
+            C3D_TexEnvInit(texture_environment = C3D_GetTexEnv(0));
             C3D_TexEnvSrc(texture_environment, C3D_Both,
                           GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
             C3D_TexEnvFunc(texture_environment, C3D_Both, GPU_MODULATE);
@@ -15403,7 +15517,7 @@ static void draw_original_frontend_list(
         }
         if (runtime->gunbarrel_hole_vertex_count != 0U) {
             size_t hole;
-            C3D_TexEnvInit(texture_environment);
+            C3D_TexEnvInit(texture_environment = C3D_GetTexEnv(0));
             C3D_TexEnvSrc(texture_environment, C3D_Both,
                           GPU_PRIMARY_COLOR, 0, 0);
             C3D_TexEnvFunc(texture_environment, C3D_Both, GPU_REPLACE);
@@ -15457,7 +15571,7 @@ static void draw_original_frontend_list(
                          * exactly TEXEL0 * SHADE.rgb * SHADE.a. Preserve its
                          * first multiplication in stage 0, then consume the
                          * vertex alpha as RGB intensity in stage 1. */
-                        C3D_TexEnvInit(texture_environment);
+                        C3D_TexEnvInit(texture_environment = C3D_GetTexEnv(0));
                         if (material_result.texture_bound != 0U) {
                             C3D_TexEnvSrc(texture_environment, C3D_RGB,
                                 GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
@@ -15522,7 +15636,7 @@ static void draw_original_frontend_list(
                 && runtime->gunbarrel_blood_texture_loaded) {
             C3D_TexBind(0,
                 (C3D_Tex *)&runtime->gunbarrel_blood_texture);
-            C3D_TexEnvInit(texture_environment);
+            C3D_TexEnvInit(texture_environment = C3D_GetTexEnv(0));
             C3D_TexEnvSrc(texture_environment, C3D_Both,
                           GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
             C3D_TexEnvFunc(texture_environment, C3D_Both, GPU_MODULATE);
@@ -15533,7 +15647,7 @@ static void draw_original_frontend_list(
                 ORIGINAL_FRONTEND_MODEL_VERTEX_OFFSET + 64U, 6U);
         } else if ((frame->layers
                     & GE_ORIGINAL_GUNBARREL_LAYER_BLOOD_COLOUR) != 0U) {
-            C3D_TexEnvInit(texture_environment);
+            C3D_TexEnvInit(texture_environment = C3D_GetTexEnv(0));
             C3D_TexEnvSrc(texture_environment, C3D_Both,
                           GPU_PRIMARY_COLOR, 0, 0);
             C3D_TexEnvFunc(texture_environment, C3D_Both, GPU_REPLACE);
@@ -15545,7 +15659,7 @@ static void draw_original_frontend_list(
         }
         if ((frame->layers & GE_ORIGINAL_GUNBARREL_LAYER_FADE_BLACK)
                 != 0U && frame->fade_alpha != 0U) {
-            C3D_TexEnvInit(texture_environment);
+            C3D_TexEnvInit(texture_environment = C3D_GetTexEnv(0));
             C3D_TexEnvSrc(texture_environment, C3D_Both,
                           GPU_PRIMARY_COLOR, 0, 0);
             C3D_TexEnvFunc(texture_environment, C3D_Both, GPU_REPLACE);
@@ -15565,10 +15679,18 @@ static void draw_original_frontend_list(
         RuntimeRendererMaterialCache material_cache = {0};
         RuntimeRendererPreparedMaterialCache prepared_cache = {0};
         size_t batch_index;
-        for (batch_index = 0U; batch_index < runtime->wallet_batch_count;
-                ++batch_index) {
+        for (batch_index = 0U; batch_index < runtime->wallet_batch_count;) {
             const GeDamRoomDrawBatch *batch =
                 &runtime->wallet_batches[batch_index];
+            size_t run_end = batch_index + 1U;
+            size_t run_vertex_count = batch->vertex_count;
+            while (run_end < runtime->wallet_batch_count
+                    && dam_batches_compatible(
+                        &runtime->wallet_batches[run_end - 1U],
+                        &runtime->wallet_batches[run_end])) {
+                run_vertex_count += runtime->wallet_batches[run_end].vertex_count;
+                ++run_end;
+            }
             const Ge3dsSceneTextureSlot *slot = ge_3ds_scene_textures_find(
                 &dam_scene_textures, batch->texture.texture_id);
             const Ge3dsMaterialBinding binding = {
@@ -15589,8 +15711,9 @@ static void draw_original_frontend_list(
                 C3D_DrawArrays(GPU_TRIANGLES,
                     ORIGINAL_FRONTEND_MODEL_VERTEX_OFFSET
                         + batch->first_vertex,
-                    batch->vertex_count);
+                    run_vertex_count);
             }
+            batch_index = run_end;
         }
     }
     C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
@@ -15641,7 +15764,7 @@ static void draw_original_frontend_list(
                             sprite->image])->loaded)
                 continue;
             C3D_TexBind(0, &texture->texture);
-            C3D_TexEnvInit(texture_environment);
+            C3D_TexEnvInit(texture_environment = C3D_GetTexEnv(0));
             C3D_TexEnvSrc(texture_environment, C3D_Both,
                           GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
             C3D_TexEnvFunc(texture_environment, C3D_Both, GPU_MODULATE);
@@ -15731,6 +15854,22 @@ static bool apply_original_frontend_music_request(
     return true;
 }
 
+static void write_frontend_probe_result(int32_t final_menu,
+                                        bool stage_requested,
+                                        int32_t level_id)
+{
+    FILE *stream;
+    if (!frontend_probe.enabled || frontend_probe.result_written) return;
+    frontend_probe.result_written = true;
+    stream = fopen(FRONTEND_PROBE_RESULT_PATH, "wb");
+    if (stream == NULL) return;
+    (void)ge_3ds_frontend_probe_write_result(&frontend_probe, stream,
+        final_menu, stage_requested, level_id);
+    fclose(stream);
+    printf("Frontend probe result written (%s).\n",
+        frontend_probe.failed ? "failed" : "complete");
+}
+
 static bool run_original_frontend(C3D_RenderTarget *top_target,
                                   bool cstick_available,
                                   GeTextureCache *texture_cache,
@@ -15801,12 +15940,38 @@ static bool run_original_frontend(C3D_RenderTarget *top_target,
     if (!apply_original_frontend_music_request(
             runtime, music_runtime, audio_output, audio_active))
         return false;
+    /* The composited 2D frontend is shown to both eyes unchanged. */
+    gfxSet3D(false);
+    if (!frontend_probe_loaded) {
+        frontend_probe_loaded = true;
+        if (ge_3ds_frontend_probe_load_path(&frontend_probe,
+                FRONTEND_PROBE_PATH, SYSCLOCK_ARM11)) {
+            mkdir(FRONTEND_PROBE_CAPTURE_DIR, 0777);
+            printf("Frontend probe: %lu steps\n",
+                   (unsigned long)frontend_probe.step_count);
+        } else if (frontend_probe.failed) {
+            printf("Frontend probe rejected: %s\n", frontend_probe.failure);
+        }
+    }
     while (aptMainLoop()) {
+        const uint64_t probe_frame_start = svcGetSystemTick();
+        uint64_t probe_capture_ticks = 0U;
+        uint64_t probe_phase_marks[5] = {0U, 0U, 0U, 0U, 0U};
         GePortInput input = read_input(cstick_available);
         GeOriginalFrontendSnapshot snapshot;
         /* Snapshot lines fill only their applicable fields. Clear optional
          * tab/color/value placement state on every page/frame. */
         Ge3dsOriginalFrontendLine lines[GE_ORIGINAL_FRONTEND_MAX_LINES] = {0};
+        if (frontend_probe.enabled) {
+            Ge3dsFrontendProbeObservation observed = {
+                .menu = frontend->current_menu,
+                .cursor = frontend->cursor,
+                .wallet_bounds = runtime->wallet_bounds,
+                .wallet_bounds_ready = runtime->wallet_bounds_ready,
+                .stage_requested = frontend->stage_requested != 0U,
+            };
+            ge_3ds_frontend_probe_apply_input(&frontend_probe, &observed, &input);
+        }
         char formatted[GE_ORIGINAL_FRONTEND_MAX_LINES][192];
         char mission_header[3][128];
         char statistics_supplemental[3][160];
@@ -15847,16 +16012,36 @@ static bool run_original_frontend(C3D_RenderTarget *top_target,
                 frontend, input_edges)
                 || !ge_original_frontend_start_snapshot(
                     frontend, &snapshot)) return false;
+        if (frontend_probe.enabled) {
+            Ge3dsFrontendProbeObservation observed = {
+                .menu = snapshot.menu,
+                .cursor = snapshot.cursor,
+                .wallet_bounds = runtime->wallet_bounds,
+                .wallet_bounds_ready = runtime->wallet_bounds_ready,
+                .stage_requested = snapshot.stage_requested != 0U,
+            };
+            ge_3ds_frontend_probe_observe(&frontend_probe, &observed);
+            if (frontend_probe.finished && !frontend_probe.result_written
+                    && (frontend_probe.failed || frontend_probe.exit_when_done)) {
+                write_frontend_probe_result(snapshot.menu,
+                    snapshot.stage_requested != 0U, runtime->requested_stage);
+                if (frontend_probe.exit_when_done || frontend_probe.failed)
+                    return false;
+            }
+        }
         if (!apply_original_frontend_music_request(
                 runtime, music_runtime, audio_output, audio_active))
             return false;
+        /* Like gameplay, produce this retrace's music frame on the New 3DS
+         * worker while the page is prepared and submitted; finish before the
+         * audio pump consumes the music ring. Original 3DS runs it inline. */
         if (audio_active && *music_runtime != NULL && !music_failed
-                && ge_original_music_runtime_tick_60hz(*music_runtime)
+                && ge_original_music_runtime_begin_tick_60hz(*music_runtime)
                     != GE_AUDIO_ABI_OK) {
             printf("Original frontend music render failed.\n");
             music_failed = true;
         }
-        if (audio_active) ge_3ds_audio_pump();
+        probe_phase_marks[0] = svcGetSystemTick();
         if (snapshot.menu == MENU_EYE_INTRO) {
             if (runtime->previous_menu != MENU_EYE_INTRO
                     || !runtime->gunbarrel_started) {
@@ -15994,9 +16179,13 @@ static bool run_original_frontend(C3D_RenderTarget *top_target,
         }
         if (snapshot.stage_requested) {
             *selected_level_id = runtime->requested_stage;
+            if (frontend_probe.enabled && !frontend_probe.result_written)
+                write_frontend_probe_result(snapshot.menu, true,
+                    runtime->requested_stage);
             return ge_stage_asset_descriptor_by_level_id(
                 runtime->requested_stage) != NULL;
         }
+        probe_phase_marks[1] = svcGetSystemTick();
         line_count = snapshot.line_count;
         for (line = 0U; line < line_count; ++line) {
             const char *text = original_frontend_text(
@@ -16346,6 +16535,8 @@ static bool run_original_frontend(C3D_RenderTarget *top_target,
             return false;
         sprite_vertex_count = append_original_frontend_sprite_vertices(
             &draw_list, &sprite_list);
+        probe_phase_marks[2] = svcGetSystemTick();
+        probe_phase_marks[3] = probe_phase_marks[2];
         if (snapshot.presentation.renderer
                     == GE_ORIGINAL_FRONTEND_RENDERER_PITEM_MODEL
                 && snapshot.presentation.model_prop >= 0) {
@@ -16368,10 +16559,57 @@ static bool run_original_frontend(C3D_RenderTarget *top_target,
                     == GE_ORIGINAL_FRONTEND_RENDERER_RAREWARE)
             (void)prepare_original_frontend_rareware(
                 runtime, &snapshot.presentation);
+        probe_phase_marks[3] = svcGetSystemTick();
+        if (frontend_probe.enabled) {
+            char capture_name[GE_3DS_FRONTEND_PROBE_NAME_CAPACITY];
+            if (ge_3ds_frontend_probe_capture_due(&frontend_probe, capture_name)) {
+                /* The image drawn two iterations ago now sits in the back
+                 * buffer once the previous queue has completed and swapped.
+                 * Blocking here only affects capture frames. */
+                const uint64_t capture_start = svcGetSystemTick();
+                char path[128];
+                bool ok;
+                C3D_FrameBegin(0);
+                (void)snprintf(path, sizeof(path), "%s/%s.ppm",
+                    FRONTEND_PROBE_CAPTURE_DIR, capture_name);
+                ok = ge_3ds_frontend_probe_write_ppm(path,
+                    gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL));
+                ge_3ds_frontend_probe_capture_written(&frontend_probe,
+                    capture_name, ok);
+                probe_capture_ticks = svcGetSystemTick() - capture_start;
+            }
+        }
         draw_original_frontend_list(top_target, runtime, snapshot.menu,
             &snapshot.presentation,
             original_frontend_page(snapshot.menu), &draw_list,
             &sprite_list, sprite_vertex_count);
+        if (audio_active && *music_runtime != NULL && !music_failed
+                && ge_original_music_runtime_finish(*music_runtime)
+                    != GE_AUDIO_ABI_OK) {
+            printf("Original frontend music completion failed.\n");
+            music_failed = true;
+        }
+        if (audio_active) ge_3ds_audio_pump();
+        if (frontend_probe.enabled) {
+            const uint64_t draw_end = svcGetSystemTick();
+            const uint64_t work = draw_end - probe_frame_start
+                - frontend_frame_begin_wait_ticks - probe_capture_ticks;
+            /* Phases: original tick/snapshot/music dispatch; intro/cast page
+             * scene ticks; text+sprite layout; model publication; GPU
+             * submission plus music join and audio pump. */
+            const uint64_t phases[5] = {
+                probe_phase_marks[0] - probe_frame_start,
+                probe_phase_marks[1] - probe_phase_marks[0],
+                probe_phase_marks[2] - probe_phase_marks[1],
+                probe_phase_marks[3] - probe_phase_marks[2],
+                draw_end - probe_phase_marks[3]
+                    - frontend_frame_begin_wait_ticks - probe_capture_ticks,
+            };
+            gspWaitForVBlank();
+            ge_3ds_frontend_probe_record_frame(&frontend_probe,
+                probe_frame_start, work, frontend_frame_begin_wait_ticks,
+                svcGetSystemTick() - draw_end, phases, snapshot.menu);
+        }
         if (snapshot.menu == MENU_RAREWARE_LOGO
                 && snapshot.presentation.duration_frames != 0U
                 && snapshot.presentation.frame
@@ -16382,7 +16620,7 @@ static bool run_original_frontend(C3D_RenderTarget *top_target,
                     == GE_ORIGINAL_GUNBARREL_TICK_COMPLETE)
             (void)ge_original_frontend_start_sequence_complete(frontend);
         runtime->previous_menu = snapshot.menu;
-        gspWaitForVBlank();
+        if (!frontend_probe.enabled) gspWaitForVBlank();
     }
     return false;
 }
@@ -16505,6 +16743,7 @@ static bool renderer_init(GeAssetPack *asset_pack,
     C3D_BindProgram(&shader_program);
     C3D_CullFace(GPU_CULL_NONE);
     projection_uniform = shaderInstanceGetUniformLocation(shader_program.vertexShader, "projection");
+    stereo_uniform = shaderInstanceGetUniformLocation(shader_program.vertexShader, "stereo");
 
     attributes = C3D_GetAttrInfo();
     AttrInfo_Init(attributes);
@@ -16513,6 +16752,10 @@ static bool renderer_init(GeAssetPack *asset_pack,
     AttrInfo_AddLoader(attributes, 2, GPU_FLOAT, 4);
 
     Mtx_OrthoTilt(&projection, 0.0f, 400.0f, 0.0f, 240.0f, 0.0f, 1.0f, true);
+    /* Screen-x maps to this clip column; stereo shifts follow the same tilt. */
+    stereo_screen_x_column[0] = projection.r[0].x;
+    stereo_screen_x_column[1] = projection.r[1].x;
+    renderer_set_stereo_layer(GE_3DS_STEREO_LAYER_FLAT);
 
     vertex_buffer = linearAlloc(TOTAL_VERTEX_COUNT * sizeof(Vertex));
     if (vertex_buffer == NULL) {
@@ -16647,7 +16890,7 @@ static bool renderer_init(GeAssetPack *asset_pack,
     BufInfo_Add(buffers, vertex_buffer, sizeof(Vertex), 3, 0x210);
 
     texture_environment = C3D_GetTexEnv(0);
-    C3D_TexEnvInit(texture_environment);
+    C3D_TexEnvInit(texture_environment = C3D_GetTexEnv(0));
     C3D_TexEnvSrc(texture_environment, C3D_Both, GPU_PRIMARY_COLOR, 0, 0);
     C3D_TexEnvFunc(texture_environment, C3D_Both, GPU_REPLACE);
     if (dam_preview != NULL && dam_preview->environment_ready
@@ -16662,9 +16905,12 @@ static void renderer_draw(const RuntimeGbiMesh *rareware_mesh,
                           const RuntimeDamPreview *dam_preview,
                           const RuntimeStageOrdinaryObjects *stage_objects,
                           const RuntimeFirstPersonScene *first_person,
-                          const GeOriginalDamMissionExitSnapshot *fade_snapshot)
+                          const GeOriginalDamMissionExitSnapshot *fade_snapshot,
+                          unsigned eye_count,
+                          C3D_RenderTarget *const eye_targets[2])
 {
     uint64_t phase_ticks[5];
+    unsigned eye_pass;
     const bool sample_submission = world_submission_detail_enabled
         && (fine_profile.rendered_frames & 15U) == 0U;
     phase_ticks[0] = svcGetSystemTick();
@@ -16995,7 +17241,20 @@ static void renderer_draw(const RuntimeGbiMesh *rareware_mesh,
         }
     }
 
+    /* Everything above prepared vertex data and ticked render-owned state
+     * exactly once. Everything below only submits GPU commands and runs once
+     * per eye; the indentation of the shared body is intentionally kept. */
+    if (eye_count == 0U) eye_count = 1U;
+    for (eye_pass = 0U; eye_pass < eye_count; ++eye_pass) {
+    stereo_current_eye = eye_count > 1U ? (eye_pass == 0U ? -1 : 1) : 0;
+    if (eye_count > 1U && eye_targets != NULL && eye_targets[eye_pass] != NULL)
+        C3D_FrameDrawOn(eye_targets[eye_pass]);
+    /* Material caches describe GPU state left by the previous draw; the
+     * other eye's HUD passes invalidate that assumption. */
+    world_material_cache.valid = false;
+    first_person_material_cache.valid = false;
     C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, projection_uniform, &projection);
+    renderer_set_stereo_layer(GE_3DS_STEREO_LAYER_FLAT);
     phase_ticks[1] = svcGetSystemTick();
     /* The original 320-wide viewport is centered in the 400-wide top screen.
      * The 3DS render target is rotated, so its 40-pixel screen pillars are the
@@ -17003,14 +17262,15 @@ static void renderer_draw(const RuntimeGbiMesh *rareware_mesh,
     C3D_SetScissor(GPU_SCISSOR_NORMAL, 0U, 40U, 240U, 360U);
     C3D_FogGasMode(GPU_NO_FOG, GPU_PLAIN_DENSITY, false);
     C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
-    C3D_TexEnvInit(texture_environment);
+    C3D_TexEnvInit(texture_environment = C3D_GetTexEnv(0));
     C3D_TexEnvSrc(texture_environment, C3D_Both, GPU_PRIMARY_COLOR, 0, 0);
     C3D_TexEnvFunc(texture_environment, C3D_Both, GPU_REPLACE);
     C3D_DrawArrays(GPU_TRIANGLES, DAM_ENVIRONMENT_VERTEX_OFFSET,
                    DAM_ENVIRONMENT_VERTEX_COUNT);
     if (sky_vertex_count != 0U) {
+        renderer_set_stereo_layer(GE_3DS_STEREO_LAYER_SKY);
         C3D_TexBind(0, &dam_cloud_texture);
-        C3D_TexEnvInit(texture_environment);
+        C3D_TexEnvInit(texture_environment = C3D_GetTexEnv(0));
         /* Original skyRender combine:
          *   ENVIRONMENT + (SHADE - ENVIRONMENT) * TEXEL0. */
         C3D_TexEnvSrc(texture_environment, C3D_RGB,
@@ -17044,24 +17304,38 @@ static void renderer_draw(const RuntimeGbiMesh *rareware_mesh,
         uint8_t room_classifications[UINT8_MAX + 1U];
         const uint8_t *room_frustum = NULL;
 
-        if (gpu_world_render) {
+        const bool replay_world_runs = eye_pass != 0U && gpu_world_render
+            && world_run_cache_valid;
+
+        if (gpu_world_render && !replay_world_runs) {
+            float widened[3][4][4];
+            const float cull_margin = eye_count > 1U
+                ? ge_3ds_stereo_max_world_shift_px(&stereo_config,
+                    stereo_slider, dam_preview->visibility_runtime.near_distance)
+                    * stereo_config.cull_margin_per_px
+                : 0.0f;
             renderer_prepare_room_visibility(&room_visibility,
                 &dam_preview->visibility_result, dam_preview->visibility_ready);
+            renderer_stereo_widen_clip(dam_preview->authored_world_to_clip,
+                widened[0], cull_margin);
+            renderer_stereo_widen_clip(dam_preview->runtime_world_to_clip,
+                widened[1], cull_margin);
+            renderer_stereo_widen_clip(dam_preview->eye_to_clip,
+                widened[2], cull_margin);
             ge_draw_batch_clip_context_init(
-                &clip_contexts[GE_DAM_ROOM_COORDINATE_AUTHORED],
-                dam_preview->authored_world_to_clip);
+                &clip_contexts[GE_DAM_ROOM_COORDINATE_AUTHORED], widened[0]);
             ge_draw_batch_clip_context_init(
-                &clip_contexts[GE_DAM_ROOM_COORDINATE_RUNTIME],
-                dam_preview->runtime_world_to_clip);
+                &clip_contexts[GE_DAM_ROOM_COORDINATE_RUNTIME], widened[1]);
             ge_draw_batch_clip_context_init(
-                &clip_contexts[GE_DAM_ROOM_COORDINATE_EYE],
-                dam_preview->eye_to_clip);
+                &clip_contexts[GE_DAM_ROOM_COORDINATE_EYE], widened[2]);
             if (renderer_prepare_room_frustum(dam_preview, &room_visibility,
                     &clip_contexts[GE_DAM_ROOM_COORDINATE_AUTHORED], room_classifications))
                 room_frustum = room_classifications;
+            world_run_count = 0U;
+            world_run_cache_valid = true;
         }
 
-        if (visibility_cache_count != 0U)
+        if (visibility_cache_count != 0U && !replay_world_runs)
             memset(world_batch_visibility_cache, 0,
                    visibility_cache_count);
 
@@ -17075,6 +17349,63 @@ static void renderer_draw(const RuntimeGbiMesh *rareware_mesh,
         } else {
             C3D_FogGasMode(GPU_NO_FOG, GPU_PLAIN_DENSITY, false);
         }
+        if (replay_world_runs) {
+            size_t run_index;
+            for (run_index = 0U; run_index < world_run_count; ++run_index) {
+                const RuntimeWorldRun *run = &world_run_cache[run_index];
+                const GeDamRoomDrawBatch *batch =
+                    &dam_preview->batches[run->batch];
+                const int batch_projection = (int)batch->coordinate_space;
+                bool material_draw_enabled;
+                if (batch_projection != coordinate_projection) {
+                    const C3D_Mtx *batch_matrix =
+                        &dam_preview->gpu_world_projection;
+                    Ge3dsStereoLayer layer = GE_3DS_STEREO_LAYER_WORLD;
+                    if (batch->coordinate_space
+                            == GE_DAM_ROOM_COORDINATE_RUNTIME)
+                        batch_matrix = &dam_preview->gpu_runtime_projection;
+                    else if (batch->coordinate_space
+                            == GE_DAM_ROOM_COORDINATE_EYE) {
+                        batch_matrix =
+                            &dam_preview->gpu_first_person_projection;
+                        layer = GE_3DS_STEREO_LAYER_FIRST_PERSON;
+                    }
+                    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, projection_uniform,
+                                     batch_matrix);
+                    renderer_set_stereo_layer(layer);
+                    coordinate_projection = batch_projection;
+                }
+                if (world_material_cache.valid
+                        && memcmp(&world_material_cache.material,
+                                  &batch->material,
+                                  sizeof(batch->material)) == 0) {
+                    material_draw_enabled =
+                        world_material_cache.result.state.draw_enabled != 0U;
+                } else {
+                    const Ge3dsSceneTextureSlot *slot =
+                        ge_3ds_scene_textures_find(
+                            &dam_scene_textures, batch->texture.texture_id);
+                    Ge3dsMaterialBinding binding = {
+                        slot != NULL ? (C3D_Tex *)&slot->texture : NULL,
+                        GE_3DS_MATERIAL_TEXTURE_FALLBACK_SHADE,
+                    };
+                    Ge3dsMaterialResult material_result;
+                    material_draw_enabled = renderer_apply_material_cached(
+                        &world_material_cache, &world_prepared_materials,
+                        &batch->material, &binding, &material_result,
+                        &fine_profile.world_material_apply_calls,
+                        &fine_profile.world_material_apply_reuses,
+                        &fine_profile.world_material_prepare_hits,
+                        &fine_profile.world_material_prepare_misses)
+                        == GE_3DS_MATERIAL_OK
+                        && material_result.state.draw_enabled != 0U;
+                }
+                if (material_draw_enabled)
+                    C3D_DrawArrays(GPU_TRIANGLES,
+                                   DAM_ROOM_VERTEX_OFFSET + run->first_vertex,
+                                   run->vertex_count);
+            }
+        } else
         for (i = 0U; i < draw_batch_count;) {
             const size_t source_index = camera_render
                 ? dam_preview->render_batches[i].source_batch : i;
@@ -17183,6 +17514,10 @@ static void renderer_draw(const RuntimeGbiMesh *rareware_mesh,
                     C3D_FVUnifMtx4x4(
                         GPU_VERTEX_SHADER, projection_uniform,
                         batch_matrix);
+                    renderer_set_stereo_layer(batch->coordinate_space
+                            == GE_DAM_ROOM_COORDINATE_EYE
+                        ? GE_3DS_STEREO_LAYER_FIRST_PERSON
+                        : GE_3DS_STEREO_LAYER_WORLD);
                     coordinate_projection = batch_projection;
                 }
             }
@@ -17230,6 +17565,17 @@ static void renderer_draw(const RuntimeGbiMesh *rareware_mesh,
                 fine_profile.world_draw_calls++;
                 fine_profile.world_authored_batches +=
                     merged_authored_batches;
+                if (gpu_world_render && world_run_cache_valid) {
+                    if (world_run_count < WORLD_RUN_CACHE_CAPACITY
+                            && source_index <= UINT16_MAX) {
+                        world_run_cache[world_run_count++] = (RuntimeWorldRun){
+                            (uint32_t)first_vertex, (uint32_t)vertex_count,
+                            (uint16_t)source_index,
+                        };
+                    } else {
+                        world_run_cache_valid = false;
+                    }
+                }
             }
             i = next;
         }
@@ -17247,6 +17593,7 @@ static void renderer_draw(const RuntimeGbiMesh *rareware_mesh,
         C3D_FogGasMode(GPU_NO_FOG, GPU_PLAIN_DENSITY, false);
         C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER,projection_uniform,
                          &dam_preview->gpu_first_person_projection);
+        renderer_set_stereo_layer(GE_3DS_STEREO_LAYER_FIRST_PERSON);
         C3D_CullFace(GPU_CULL_BACK_CCW);
         /* texSelect(..., mode 4, zbuffer 1) is the canonical cloud-surface
          * pass: depth-tested translucent color, without a depth write. */
@@ -17254,7 +17601,7 @@ static void renderer_draw(const RuntimeGbiMesh *rareware_mesh,
         C3D_AlphaTest(false,GPU_ALWAYS,0U);
         C3D_AlphaBlend(GPU_BLEND_ADD,GPU_BLEND_ADD,GPU_SRC_ALPHA,
             GPU_ONE_MINUS_SRC_ALPHA,GPU_ONE,GPU_ZERO);
-        C3D_TexEnvInit(texture_environment);
+        C3D_TexEnvInit(texture_environment = C3D_GetTexEnv(0));
         C3D_TexEnvSrc(texture_environment,C3D_Both,
                       GPU_TEXTURE0,GPU_PRIMARY_COLOR,0);
         C3D_TexEnvFunc(texture_environment,C3D_Both,GPU_MODULATE);
@@ -17283,13 +17630,14 @@ static void renderer_draw(const RuntimeGbiMesh *rareware_mesh,
          * this block only submits its read-only published vertices. */
         C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, projection_uniform,
                          &dam_preview->gpu_world_projection);
+        renderer_set_stereo_layer(GE_3DS_STEREO_LAYER_WORLD);
         C3D_CullFace(GPU_CULL_NONE);
         C3D_DepthTest(true, GPU_GREATER, GPU_WRITE_COLOR);
         C3D_AlphaTest(false, GPU_ALWAYS, 0U);
         C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD,
             GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA, GPU_ONE, GPU_ZERO);
         C3D_TexBind(0, &autogun_beam_texture);
-        C3D_TexEnvInit(texture_environment);
+        C3D_TexEnvInit(texture_environment = C3D_GetTexEnv(0));
         C3D_TexEnvSrc(texture_environment, C3D_RGB,
                       GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
         C3D_TexEnvFunc(texture_environment, C3D_RGB, GPU_MODULATE);
@@ -17305,6 +17653,7 @@ static void renderer_draw(const RuntimeGbiMesh *rareware_mesh,
             && dam_preview != NULL && dam_preview->gpu_world_ready) {
         C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, projection_uniform,
                           &dam_preview->gpu_first_person_projection);
+        renderer_set_stereo_layer(GE_3DS_STEREO_LAYER_FIRST_PERSON);
         for (i = 0U; i < first_person->batch_count;) {
             const GeDamRoomDrawBatch *batch;
             const Ge3dsSceneTextureSlot *slot;
@@ -17358,6 +17707,7 @@ static void renderer_draw(const RuntimeGbiMesh *rareware_mesh,
         }
     }
     C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, projection_uniform, &projection);
+    renderer_set_stereo_layer(GE_3DS_STEREO_LAYER_HUD);
     C3D_SetScissor(GPU_SCISSOR_DISABLE, 0U, 0U, 0U, 0U);
     phase_ticks[3] = svcGetSystemTick();
     C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
@@ -17404,7 +17754,7 @@ static void renderer_draw(const RuntimeGbiMesh *rareware_mesh,
                            + mission_hud_draw.box_vertex_count,
                        mission_hud_draw.glyph_vertex_count);
     }
-    C3D_TexEnvInit(texture_environment);
+    C3D_TexEnvInit(texture_environment = C3D_GetTexEnv(0));
     C3D_TexEnvSrc(texture_environment, C3D_Both, GPU_PRIMARY_COLOR, 0, 0);
     C3D_TexEnvFunc(texture_environment, C3D_Both, GPU_REPLACE);
     if (!watch_open && !credits_active && gun_sight_vertex_count != 0U) {
@@ -17423,7 +17773,7 @@ static void renderer_draw(const RuntimeGbiMesh *rareware_mesh,
         C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD,
             GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA, GPU_ONE, GPU_ZERO);
         C3D_TexBind(0, &right_ammo_icon->texture);
-        C3D_TexEnvInit(texture_environment);
+        C3D_TexEnvInit(texture_environment = C3D_GetTexEnv(0));
         C3D_TexEnvSrc(texture_environment, C3D_RGB,
                       GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
         C3D_TexEnvFunc(texture_environment, C3D_RGB, GPU_MODULATE);
@@ -17439,7 +17789,7 @@ static void renderer_draw(const RuntimeGbiMesh *rareware_mesh,
         C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD,
             GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA, GPU_ONE, GPU_ZERO);
         C3D_TexBind(0, &left_ammo_icon->texture);
-        C3D_TexEnvInit(texture_environment);
+        C3D_TexEnvInit(texture_environment = C3D_GetTexEnv(0));
         C3D_TexEnvSrc(texture_environment, C3D_RGB,
                       GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
         C3D_TexEnvFunc(texture_environment, C3D_RGB, GPU_MODULATE);
@@ -17459,13 +17809,16 @@ static void renderer_draw(const RuntimeGbiMesh *rareware_mesh,
         /* This pass follows textured HUD draws.  Restore the original
          * G_CC_PRIMITIVE semantics explicitly so their bound font/ammo
          * texture cannot modulate a damage flash to black. */
-        C3D_TexEnvInit(texture_environment);
+        C3D_TexEnvInit(texture_environment = C3D_GetTexEnv(0));
         C3D_TexEnvSrc(texture_environment, C3D_Both,
                       GPU_PRIMARY_COLOR, 0, 0);
         C3D_TexEnvFunc(texture_environment, C3D_Both, GPU_REPLACE);
+        renderer_set_stereo_layer(GE_3DS_STEREO_LAYER_FLAT);
         C3D_DrawArrays(GPU_TRIANGLES, FADE_OVERLAY_VERTEX_OFFSET,
                        FADE_OVERLAY_VERTEX_COUNT);
     }
+    }
+    stereo_current_eye = 0;
     phase_ticks[4] = svcGetSystemTick();
     for (i = 0U; i < 4U; ++i)
         fine_profile.renderer_phase_ticks[i] += phase_ticks[i + 1U] - phase_ticks[i];
@@ -18283,11 +18636,12 @@ static void print_runtime_console_header(
     printf("GoldenEye 007 - native 3DS port\n");
     printf("Stage: %s (LEVELID %ld)\n\n", stage_assets->key,
            (long)selected_level_id);
-    printf("Circle Pad   Move\n");
-    printf("C-stick      Look\n");
-    printf("R / B / Y    Fire / Use / Reload\n");
+    printf("Circle Pad   Move / strafe\n");
+    printf("C-Stick      Look\n");
+    printf("R or ZR      Fire\n");
+    printf("L or ZL      Aim (hold); + Circle Pad down crouches\n");
+    printf("B / Y        Use / reload\n");
     printf("A / X        Next / previous weapon\n");
-    printf("L / ZR       Aim / crouch\n");
     printf("START        Bond watch / pause\n");
 }
 
@@ -18342,6 +18696,7 @@ int main(void)
     bool clip_stage_ready = false;
     bool audio_abi_ready = false;
     bool stage_transition_pending = false;
+    bool stereo_active = false;
     bool gameplay_stage_ended = false;
     bool run_start_frontend = true;
     bool next_stage_requested = false;
@@ -18378,6 +18733,23 @@ int main(void)
         goto exit_citro3d;
     }
     C3D_RenderTargetSetOutput(top_target, GFX_TOP, GFX_LEFT, DISPLAY_TRANSFER_FLAGS);
+    /* Right-eye target for stereoscopic gameplay. Its absence only disables
+     * the 3D slider; it never blocks startup. */
+    right_target = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8,
+                                          GPU_RB_DEPTH24_STENCIL8);
+    if (right_target != NULL)
+        C3D_RenderTargetSetOutput(right_target, GFX_TOP, GFX_RIGHT,
+                                  DISPLAY_TRANSFER_FLAGS);
+    {
+        FILE *stereo_stream = fopen(STEREO_CONFIG_PATH, "rb");
+        if (stereo_stream != NULL) {
+            if (!ge_3ds_stereo_config_load(&stereo_config, stereo_stream))
+                printf("stereo.cfg: some values rejected.\n");
+            fclose(stereo_stream);
+        } else {
+            ge_3ds_stereo_config_defaults(&stereo_config);
+        }
+    }
 
     assets_mounted = ge_asset_pack_open(
                          &asset_pack, "sdmc:/3ds/goldeneye-3ds/goldeneye.u.gepack") ==
@@ -18812,8 +19184,19 @@ start_stage_runtime:
         ge_original_door_runtime_bind(
             &door_runtime_providers, &dam_objects.door_runtime);
     }
+    if (!visual_probe_tour.enabled && !load_input_probe(&input_probe)
+            && frontend_probe.enabled && frontend_probe.gameplay_frames != 0U
+            && !run_start_frontend) {
+        /* A frontend probe that reached gameplay measures the stage's first
+         * frames with the existing idle-controller timing path. */
+        memset(&input_probe, 0, sizeof(input_probe));
+        input_probe.target_frames = frontend_probe.gameplay_frames;
+        input_probe.active_frames = frontend_probe.gameplay_frames;
+        input_probe.enabled = true;
+        frontend_probe.gameplay_frames = 0U;
+    }
     if (!visual_probe_tour.enabled
-            && load_input_probe(&input_probe)) {
+            && (input_probe.enabled || load_input_probe(&input_probe))) {
         /* Stick/button traces are stage-independent and use the same exact
          * live input path. Existing coordinate routes name Dam-authored pads
          * and guards, so never silently run those routes on another stage. */
@@ -18828,6 +19211,21 @@ start_stage_runtime:
         printf("Input probe:  %lu exact-input frames\n",
                (unsigned long)input_probe.target_frames);
         }
+    }
+    {
+        /* Live play uses the original two-controller 2.2 style on the two
+         * analog sticks. RAMROM attract replays were recorded against the
+         * 1.1 style, and the input probe routes steer with the move stick
+         * as 1.1 turn input, so both keep the single-stick layout. */
+        const bool dual_analog = load_controls_dual_analog()
+            && !input_probe.enabled
+            && !original_frontend_runtime.ramrom_active;
+        ge_original_input_set_dual_analog(dual_analog);
+        ge_original_bond_input_set_control_style(
+            dual_analog ? CONTROLLER_CONFIG_GALORE : CONTROLLER_CONFIG_HONEY);
+        if (!dual_analog && !original_frontend_runtime.ramrom_active
+                && !input_probe.enabled)
+            printf("Controls:     single stick (1.1)\n");
     }
     world_submission_detail_enabled = false;
     if (input_probe.enabled) {
@@ -19053,6 +19451,20 @@ start_stage_runtime:
             fine_profile.frame_begin_ticks += svcGetSystemTick() - frame_begin_start;
             if (input_probe.enabled)
                 previous_gpu_us = (uint32_t)(C3D_GetDrawingTime() * 1000.0f);
+        }
+        if (frontend_probe.enabled && frontend_probe.gameplay_capture_frame != 0U
+                && fine_profile.rendered_frames
+                    == frontend_probe.gameplay_capture_frame + 2U) {
+            /* Diagnostic capture of both eyes' displayed images: the frame
+             * submitted two presentations ago now occupies the back buffers. */
+            (void)ge_3ds_frontend_probe_write_ppm(
+                FRONTEND_PROBE_CAPTURE_DIR "/gameplay-left.ppm",
+                gfxGetFramebuffer(GFX_TOP, GFX_LEFT, NULL, NULL));
+            if (gfxIs3D())
+                (void)ge_3ds_frontend_probe_write_ppm(
+                    FRONTEND_PROBE_CAPTURE_DIR "/gameplay-right.ppm",
+                    gfxGetFramebuffer(GFX_TOP, GFX_RIGHT, NULL, NULL));
+            frontend_probe.gameplay_capture_frame = 0U;
         }
 
         {
@@ -19965,12 +20377,22 @@ start_stage_runtime:
             uint64_t fine_start;
             GeOriginalDamMissionExitSnapshot fade_snapshot = {0};
             ge_original_dam_mission_exit_services_snapshot(&fade_snapshot);
+            C3D_RenderTarget *const eye_targets[2] = {top_target, right_target};
+            /* The slider is sampled once per submitted frame. Zero keeps the
+             * exact mono path and shows the left image to both eyes. */
+            stereo_slider = osGet3DSliderState();
+            stereo_active = right_target != NULL && stereo_config.enabled
+                && stereo_slider > 0.0f;
+            gfxSet3D(stereo_active);
             C3D_RenderTargetClear(top_target, C3D_CLEAR_ALL, CLEAR_COLOR, 0);
+            if (stereo_active)
+                C3D_RenderTargetClear(right_target, C3D_CLEAR_ALL, CLEAR_COLOR, 0);
             C3D_FrameDrawOn(top_target);
             fine_start = svcGetSystemTick();
             renderer_draw(&rareware_mesh, &blotter_preview,
                           &dam_preview, &stage_ordinary_objects,
-                          &first_person_scene, &fade_snapshot);
+                          &first_person_scene, &fade_snapshot,
+                          stereo_active ? 2U : 1U, eye_targets);
             fine_profile.renderer_draw_ticks +=
                 svcGetSystemTick() - fine_start;
             /* Submit at most once per display interval. A short frame after

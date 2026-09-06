@@ -6,7 +6,8 @@ menu/objective/audio fixes, validation limits and remaining acceptance work,
 see [the single-player parity checkpoint](SinglePlayerParity.md). Earlier live
 integrations are recorded in
 [the September 2 verification checkpoint](Verification20260902.md).
-The latest measured optimization and correctness repair are recorded in
+The latest checkpoint is
+[frontend traversal, menu budget and stereoscopic 3D](Verification20260905FrontendStereo.md), following
 [the New 3DS music worker](Verification20260905MusicWorker.md) and
 [native weapon collision geometry](Verification20260905NativeHitGeometry.md), following
 [guard collection and exact vertex publication](Verification20260905GuardConstruction.md), following
@@ -28,8 +29,12 @@ which is reported on the bottom screen. The level renderer separately consumes t
 The complete untouched `src/joy.c` is now linked into the ARM11 runtime as well. The native input bridge presents
 the Circle Pad and C-stick as two virtual N64 controllers, feeds the original 20-sample playback ring once per
 logical tick, and reads back GoldenEye's own button-edge, mask, clamp, and range-normalization results. Logical 3DS
-actions are provisionally mapped to N64 buttons (`Z` fire, `B` use/reload, `A` next weapon, `START` pause); the
-mapping will be finalized when the original player-control path is connected.
+actions are mapped to N64 buttons (`Z` fire, `B` use/reload, `A` next weapon, `START` pause). Live play uses
+GoldenEye's own two-controller 2.2 (Galore) control style: the Circle Pad is the walk/strafe stick, the C-Stick is
+the turn/pitch stick, R or ZR fires, L or ZL aims, and the original aim-plus-Circle-Pad-down crouch and zoom
+gestures apply. `sdmc:/3ds/goldeneye-3ds/controls.cfg` with `dual_analog 0` restores the single-stick 1.1 layout
+(Circle Pad moves and turns, C-Stick quantized to C-buttons); RAMROM attract replays and input-probe routes always
+use that layout because their recordings assume it. See `docs/Verification20260905FrontendStereo.md`.
 A source-compatible `boss.c` stage-state slice is now live as well: the original title request, deferred stage
 selection, stage getter and debug/memory flag state execute on ARM11 behind a small snapshot adapter. A bounded
 `lvlManageMpGame` stage-tick slice now runs once per portable tick. It retains the original clock, idle latch,

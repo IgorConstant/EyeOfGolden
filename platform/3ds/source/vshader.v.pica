@@ -1,6 +1,10 @@
 ; Minimal PICA200 shader for the first native renderer milestone.
 
 .fvec projection[4]
+; Stereoscopic clip-space shift: stereo[0] scales with clip w, stereo[1] is
+; constant.  Both are zero for mono rendering and for layers pinned to the
+; screen plane; see ge_3ds_stereo.h for the derivation.
+.fvec stereo[2]
 
 .constf constants(0.0, 1.0, 0.0, 0.0)
 .alias ones constants.yyyy
@@ -17,10 +21,15 @@
     mov r0.xyz, inpos
     mov r0.w, ones
 
-    dp4 outpos.x, projection[0], r0
-    dp4 outpos.y, projection[1], r0
-    dp4 outpos.z, projection[2], r0
-    dp4 outpos.w, projection[3], r0
+    dp4 r1.x, projection[0], r0
+    dp4 r1.y, projection[1], r0
+    dp4 r1.z, projection[2], r0
+    dp4 r1.w, projection[3], r0
+
+    ; Off-axis eye offset as an affine function of the homogeneous depth.
+    mul r2, stereo[0], r1.wwww
+    add r1, r1, r2
+    add outpos, stereo[1], r1
 
     ; The two-component attribute loader supplies the native default z/w
     ; components.  Copy the complete register, matching citro3d's textured

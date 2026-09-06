@@ -53,7 +53,13 @@ assert (
     "RuntimeRendererMaterialCache first_person_material_cache = {0};"
     in renderer_draw
 )
-assert renderer_draw.count("renderer_apply_material_cached(") == 2
+# Three call sites: the world batch loop, the stereoscopic right eye's replay
+# of the left eye's recorded world runs, and the first-person loop.
+assert renderer_draw.count("renderer_apply_material_cached(") == 3
+# Each eye pass starts with both caches invalidated: the other eye's HUD
+# passes changed the GPU state a valid cache would claim to describe.
+assert renderer_draw.count("world_material_cache.valid = false;") == 1
+assert renderer_draw.count("first_person_material_cache.valid = false;") == 1
 assert "qsort(" not in renderer_draw
 assert "C3D_DrawArrays(GPU_TRIANGLES" in renderer_draw
 
